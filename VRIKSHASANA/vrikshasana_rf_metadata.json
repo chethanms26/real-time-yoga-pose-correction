@@ -1,0 +1,25 @@
+{
+    "pose_name": "Vrikshasana",
+    "features": [
+        "left_knee",
+        "right_knee",
+        "left_hip",
+        "right_hip",
+        "left_shoulder",
+        "right_shoulder"
+    ],
+    "target_mapping": {
+        "0": "Incorrect",
+        "1": "Correct"
+    },
+    "train_accuracy": 1.0,
+    "val_accuracy": 1.0,
+    "test_accuracy": 1.0,
+    "test_precision": 1.0,
+    "test_recall": 1.0,
+    "test_f1_score": 1.0,
+    "n_estimators": 100,
+    "random_state": 42,
+    "data_cleaned": true,
+    "note": "Removed 17 rows violating the official shoulder threshold (must be 3-50 or 150-180 deg) from Correct class. Added 400 synthetic negative examples pairing realistic knee/hip values with shoulder angles in the excluded 51-149 deg gap."
+}
