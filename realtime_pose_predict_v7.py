@@ -54,6 +54,9 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 
 import numpy as np
 import json
+import threading
+import queue
+import time
 from collections import deque
 
 TEST_MODE = os.environ.get("RUN_SCREENSHOT_TESTS") == "1"
@@ -62,6 +65,7 @@ if not TEST_MODE:
     import joblib
     import cv2
     import mediapipe as mp
+    import pyttsx3
 
     mp_pose = mp.solutions.pose
 
@@ -404,15 +408,22 @@ def bhujangasana_standing_override(feature_values):
 
 
 def vrikshasana_arms_down_override(feature_values):
+    # Both arms must be raised overhead - if EITHER arm is down, it's not
+    # the pose. Previously used "and" here, which only caught the case
+    # where both arms were down and let a one-arm-raised pose slip through
+    # to the raw ML model (which hadn't reliably seen that asymmetric case
+    # and sometimes still called it Correct).
     return (
-        feature_values["left_shoulder"] < VRIKSHASANA_RAISED_SHOULDER_MIN and
+        feature_values["left_shoulder"] < VRIKSHASANA_RAISED_SHOULDER_MIN or
         feature_values["right_shoulder"] < VRIKSHASANA_RAISED_SHOULDER_MIN
     )
 
 
 def tadasana_arms_down_override(feature_values):
+    # Same fix as Vrikshasana above - either arm down should fail the pose,
+    # not just both arms down.
     return (
-        feature_values["left_shoulder"] < TADASANA_RAISED_SHOULDER_MIN and
+        feature_values["left_shoulder"] < TADASANA_RAISED_SHOULDER_MIN or
         feature_values["right_shoulder"] < TADASANA_RAISED_SHOULDER_MIN
     )
 
@@ -456,10 +467,10 @@ def apply_pose_safety_overrides(pose_name, prediction, raw_confidence, feature_v
 # the overrides catch failures (e.g. AC leg-lift / ankle-height) that
 # angle thresholds alone can't reliably detect - see module docstring.
 OVERRIDE_REASON_MESSAGES = {
-    "standing posture": "Lower into the pose - this still reads as standing upright",
-    "hands not raised": "Raise both arms overhead to complete the pose",
-    "leg not lifted": "Lift your extended leg higher off the ground",
-    "both feet grounded": "Lift one leg off the ground - both feet are still planted",
+    "standing posture": "You're still standing - lie down or lower into the pose",
+    "hands not raised": "Lift both arms up overhead",
+    "leg not lifted": "Lift your leg higher off the ground",
+    "both feet grounded": "Lift one leg off the ground",
 }
 
 
@@ -477,23 +488,29 @@ def get_override_messages(reasons):
 # single pair of directional messages cover every joint without needing
 # to special-case what "straighten" means per pose.
 
-def _knee_or_hip_message(side, joint_label, actual, low, high):
+def _knee_or_hip_message(side, part, actual, low, high):
+    """part is 'knee' or 'hip' - kept plain and consistent everywhere,
+    no 'standing'/'lifted' jargon in the displayed text."""
     if actual < low - JOINT_MESSAGE_DEADBAND:
         deviation = low - actual
-        return (f"Straighten your {side} {joint_label} a little more", deviation)
+        if part == "knee":
+            return (f"Straighten your {side} leg", deviation)
+        return (f"Straighten up a little through your {side} hip", deviation)
     if actual > high + JOINT_MESSAGE_DEADBAND:
         deviation = actual - high
-        return (f"Bend your {side} {joint_label} a little more", deviation)
+        if part == "knee":
+            return (f"Bend your {side} knee a little", deviation)
+        return (f"Bend forward a little more at your {side} hip", deviation)
     return None
 
 
 def _shoulder_message(side, actual, low, high):
     if actual < low - JOINT_MESSAGE_DEADBAND:
         deviation = low - actual
-        return (f"Raise your {side} arm a little higher", deviation)
+        return (f"Lift your {side} arm higher", deviation)
     if actual > high + JOINT_MESSAGE_DEADBAND:
         deviation = actual - high
-        return (f"Lower your {side} arm closer to your side", deviation)
+        return (f"Lower your {side} arm down", deviation)
     return None
 
 
@@ -530,7 +547,7 @@ def _bhujangasana_violations(feature_values):
     knee_avg = (feature_values["left_knee"] + feature_values["right_knee"]) / 2
     hip_avg = (feature_values["left_hip"] + feature_values["right_hip"]) / 2
     if knee_avg > 165 and hip_avg > 150:
-        return ["Lie face-down on the floor, then lift your chest for Cobra pose"]
+        return ["Lie down on your stomach, then lift your chest up"]
 
     l_low, l_high = BHUJANGASANA_JOINT_RANGES["left_shoulder"]
     r_low, r_high = BHUJANGASANA_JOINT_RANGES["right_shoulder"]
@@ -538,9 +555,9 @@ def _bhujangasana_violations(feature_values):
     right_val = feature_values["right_shoulder"]
 
     if left_val < l_low - JOINT_MESSAGE_DEADBAND or right_val < r_low - JOINT_MESSAGE_DEADBAND:
-        return ["Press through your palms and lift your chest a little higher"]
+        return ["Push up a little more and lift your chest higher"]
     if left_val > l_high + JOINT_MESSAGE_DEADBAND or right_val > r_high + JOINT_MESSAGE_DEADBAND:
-        return ["Ease back a little - you're pressing up too far"]
+        return ["Don't push up so high - relax a little"]
     return []
 
 
@@ -577,10 +594,10 @@ def get_joint_violation_messages(pose_name, feature_values):
         lk_low, lk_high = VRIKSHASANA_ROLE_RANGES["lifted_knee"]
         sh_low, sh_high = VRIKSHASANA_ROLE_RANGES["standing_hip"]
         lh_low, lh_high = VRIKSHASANA_ROLE_RANGES["lifted_hip"]
-        candidates.append(_knee_or_hip_message(standing_side, "standing knee", standing_knee, sk_low, sk_high))
-        candidates.append(_knee_or_hip_message(lifted_side, "lifted knee", lifted_knee, lk_low, lk_high))
-        candidates.append(_knee_or_hip_message(standing_side, "standing hip", standing_hip, sh_low, sh_high))
-        candidates.append(_knee_or_hip_message(lifted_side, "lifted hip", lifted_hip, lh_low, lh_high))
+        candidates.append(_knee_or_hip_message(standing_side, "knee", standing_knee, sk_low, sk_high))
+        candidates.append(_knee_or_hip_message(lifted_side, "knee", lifted_knee, lk_low, lk_high))
+        candidates.append(_knee_or_hip_message(standing_side, "hip", standing_hip, sh_low, sh_high))
+        candidates.append(_knee_or_hip_message(lifted_side, "hip", lifted_hip, lh_low, lh_high))
         vs_low, vs_high = VRIKSHASANA_SHOULDER_RANGE
         candidates.append(_shoulder_message("left", feature_values["left_shoulder"], vs_low, vs_high))
         candidates.append(_shoulder_message("right", feature_values["right_shoulder"], vs_low, vs_high))
@@ -589,8 +606,8 @@ def get_joint_violation_messages(pose_name, feature_values):
         standing_side, lifted_side, standing_knee, lifted_knee, _sh, _lh = _role_split(feature_values)
         sk_low, sk_high = ARDHA_CHANDRASANA_ROLE_RANGES["standing_knee"]
         lk_low, lk_high = ARDHA_CHANDRASANA_ROLE_RANGES["lifted_knee"]
-        candidates.append(_knee_or_hip_message(standing_side, "standing knee", standing_knee, sk_low, sk_high))
-        candidates.append(_knee_or_hip_message(lifted_side, "lifted knee", lifted_knee, lk_low, lk_high))
+        candidates.append(_knee_or_hip_message(standing_side, "knee", standing_knee, sk_low, sk_high))
+        candidates.append(_knee_or_hip_message(lifted_side, "knee", lifted_knee, lk_low, lk_high))
         # Hip intentionally omitted - see module docstring. The existing
         # leg-lift / ankle-height overrides already report "leg not
         # lifted" / "both feet grounded" for that class of error.
@@ -631,6 +648,18 @@ def run_screenshot_regression_tests():
             [178.9, 179.7, 176.3, 177.2, 10.9, 13.7],
             "hands not raised",
         ),
+        (
+            "Vrikshasana one arm raised, one arm down - should still fail",
+            "Vrikshasana",
+            [178.0, 90.0, 175.0, 130.0, 170.0, 20.0],
+            "hands not raised",
+        ),
+        (
+            "Tadasana one arm raised, one arm down - should still fail",
+            "Tadasana",
+            [177.0, 178.0, 176.0, 177.0, 170.0, 20.0],
+            "hands not raised",
+        ),
     ]
 
     passed = True
@@ -662,7 +691,7 @@ def run_joint_violation_tests():
             "Tadasana",
             {"left_knee": 140.0, "right_knee": 178.0, "left_hip": 178.0,
              "right_hip": 178.0, "left_shoulder": 178.0, "right_shoulder": 178.0},
-            ["left knee"],
+            ["left leg"],
         ),
         (
             "Tadasana: arms not raised, should flag both arms",
@@ -676,21 +705,21 @@ def run_joint_violation_tests():
             "Bhujangasana",
             {"left_knee": 150.0, "right_knee": 150.0, "left_hip": 140.0,
              "right_hip": 140.0, "left_shoulder": 10.0, "right_shoulder": 10.0},
-            ["lift your chest"],
+            ["chest higher"],
         ),
         (
             "Bhujangasana: pressed up too far while lying down, expect ease-back cue",
             "Bhujangasana",
             {"left_knee": 150.0, "right_knee": 150.0, "left_hip": 140.0,
              "right_hip": 140.0, "left_shoulder": 30.0, "right_shoulder": 90.0},
-            ["Ease back"],
+            ["Don't push up"],
         ),
         (
             "Bhujangasana: still standing/bent-forward (not lying down), expect lie-down cue not knee-bend advice",
             "Bhujangasana",
             {"left_knee": 178.0, "right_knee": 179.0, "left_hip": 171.6,
              "right_hip": 157.6, "left_shoulder": 8.8, "right_shoulder": 19.9},
-            ["Lie face-down"],
+            ["Lie down"],
         ),
         (
             "Trikonasana: right hip not folded enough, flag right hip",
@@ -700,25 +729,25 @@ def run_joint_violation_tests():
             ["right hip"],
         ),
         (
-            "Vrikshasana: lifted leg not tucked (knee too straight), flag lifted knee",
+            "Vrikshasana: lifted leg not tucked (knee too straight), flag right knee",
             "Vrikshasana",
             {"left_knee": 178.0, "right_knee": 150.0, "left_hip": 176.0,
              "right_hip": 130.0, "left_shoulder": 170.0, "right_shoulder": 170.0},
-            ["lifted knee"],
+            ["right knee"],
         ),
         (
             "Vrikshasana: right leg standing this time, left leg lifted+not tucked",
             "Vrikshasana",
             {"left_knee": 150.0, "right_knee": 178.0, "left_hip": 130.0,
              "right_hip": 176.0, "left_shoulder": 170.0, "right_shoulder": 170.0},
-            ["left", "lifted knee"],
+            ["left knee"],
         ),
         (
-            "Ardha Chandrasana: lifted knee bent, flag lifted knee",
+            "Ardha Chandrasana: lifted knee bent, flag right leg",
             "Ardha Chandrasana",
             {"left_knee": 178.0, "right_knee": 130.0, "left_hip": 170.0,
              "right_hip": 90.0, "left_shoulder": 100.0, "right_shoulder": 20.0},
-            ["lifted knee"],
+            ["right leg"],
         ),
     ]
 
@@ -746,7 +775,7 @@ def run_override_message_wiring_tests():
         (
             "AC leg-lift override reason produces a display message",
             ["leg not lifted"],
-            "Lift your extended leg higher",
+            "Lift your leg higher",
         ),
         (
             "AC ankle-height override reason produces a display message",
@@ -756,7 +785,7 @@ def run_override_message_wiring_tests():
         (
             "Bhujangasana standing-posture override reason produces a message",
             ["standing posture"],
-            "Lower into the pose",
+            "still standing",
         ),
     ]
     passed = True
@@ -768,6 +797,125 @@ def run_override_message_wiring_tests():
 
     if not passed:
         raise AssertionError("One or more override-message wiring tests failed.")
+
+
+# ---------------------------------------------------------------
+# VOICE FEEDBACK (v7)
+# ---------------------------------------------------------------
+class VoiceFeedback:
+    """
+    Speaks the current top correction message aloud, off the main video
+    thread so speech never blocks frame processing (pyttsx3's runAndWait()
+    blocks the calling thread until speech finishes).
+
+    Debouncing: only queues NEW speech when the text actually changes, or
+    the same message has been showing for longer than REPEAT_AFTER seconds
+    (a standing reminder if you haven't fixed it yet). Without this, a
+    message that's technically re-selected every frame (see the raw-frame
+    sync fix) would try to speak dozens of times a second.
+    """
+    REPEAT_AFTER = 6.0  # seconds before repeating an unresolved correction
+
+    def __init__(self):
+        self.engine = pyttsx3.init()
+        self.engine.setProperty("rate", 165)
+        self._queue = queue.Queue()
+        self._last_text = None
+        self._last_spoken_at = 0.0
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def _worker(self):
+        while True:
+            text = self._queue.get()
+            if text is None:
+                break
+            self.engine.say(text)
+            self.engine.runAndWait()
+
+    def update(self, top_message, is_correct):
+        """Call once per frame with the current top correction message
+        (or None) and whether the stable verdict is currently Correct."""
+        now = time.time()
+
+        if is_correct:
+            if self._last_text != "__correct__":
+                self._queue.put("Correct, nice job")
+                self._last_text = "__correct__"
+                self._last_spoken_at = now
+            return
+
+        if top_message is None:
+            self._last_text = None
+            return
+
+        if top_message != self._last_text or (now - self._last_spoken_at) > self.REPEAT_AFTER:
+            self._queue.put(top_message)
+            self._last_text = top_message
+            self._last_spoken_at = now
+
+    def stop(self):
+        self._queue.put(None)
+
+
+def run_voice_feedback_tests():
+    """
+    VoiceFeedback debounce logic tested without touching pyttsx3/audio -
+    swap the queue for a plain list so this runs in TEST_MODE too.
+    """
+    class FakeVoice(VoiceFeedback):
+        def __init__(self):
+            self.spoken = []
+            self._last_text = None
+            self._last_spoken_at = 0.0
+
+        def _speak(self, text):
+            self.spoken.append(text)
+
+        def update(self, top_message, is_correct):
+            now = time.time()
+            if is_correct:
+                if self._last_text != "__correct__":
+                    self._speak("Correct, nice job")
+                    self._last_text = "__correct__"
+                    self._last_spoken_at = now
+                return
+            if top_message is None:
+                self._last_text = None
+                return
+            if top_message != self._last_text or (now - self._last_spoken_at) > self.REPEAT_AFTER:
+                self._speak(top_message)
+                self._last_text = top_message
+                self._last_spoken_at = now
+
+    passed = True
+
+    v = FakeVoice()
+    v.update("Straighten your left leg", False)
+    v.update("Straighten your left leg", False)
+    v.update("Straighten your left leg", False)
+    ok = v.spoken == ["Straighten your left leg"]
+    passed = passed and ok
+    print(f"Same message repeated frames -> spoken once: {'PASS' if ok else 'FAIL'} -> {v.spoken}")
+
+    v = FakeVoice()
+    v.update("Straighten your left leg", False)
+    v.update("Bend your right knee a little", False)
+    ok = v.spoken == ["Straighten your left leg", "Bend your right knee a little"]
+    passed = passed and ok
+    print(f"Message change speaks immediately: {'PASS' if ok else 'FAIL'} -> {v.spoken}")
+
+    v = FakeVoice()
+    v.update("Straighten your left leg", False)
+    v.update(None, True)
+    v.update(None, True)
+    v.update("Straighten your left leg", False)
+    ok = v.spoken == ["Straighten your left leg", "Correct, nice job", "Straighten your left leg"]
+    passed = passed and ok
+    print(f"Correct then incorrect again re-speaks: {'PASS' if ok else 'FAIL'} -> {v.spoken}")
+
+    if not passed:
+        raise AssertionError("One or more voice-feedback debounce tests failed.")
 
 
 class StabilityTracker:
@@ -826,6 +974,13 @@ def main():
     tracker = StabilityTracker()
     missing_frame_count = 0
 
+    try:
+        voice = VoiceFeedback()
+        print("[voice] feedback enabled")
+    except Exception as e:
+        voice = None
+        print(f"[voice] could not start voice feedback, continuing without it: {e}")
+
     t1 = time.time()
     cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
     print(f"[timing] cv2.VideoCapture(0) call returned: {time.time() - t1:.1f}s")
@@ -881,7 +1036,19 @@ def main():
 
                 stable_label, stable_confidence = tracker.update(prediction, raw_confidence)
 
+                # Joint-violation / override messages are driven by the RAW,
+                # current-frame prediction - not stable_label. stable_label is
+                # smoothed over several frames on purpose (to stop the big
+                # Correct/Incorrect banner flickering), but that same delay
+                # made the coaching messages feel late or missing entirely
+                # during "Analyzing...". The messages below now always match
+                # what you're doing on THIS frame.
                 joint_messages = []
+                if prediction == 0:
+                    joint_messages = get_override_messages(override_reasons)
+                    joint_messages += get_joint_violation_messages(pose_name, feature_values)
+                    joint_messages = joint_messages[:MAX_JOINT_MESSAGES]
+
                 if stable_label is None:
                     stable_status_text = "Analyzing..."
                     status_color = (200, 200, 200)
@@ -889,14 +1056,10 @@ def main():
                     label_name = "Correct" if stable_label == 1 else "Incorrect"
                     stable_status_text = f"{label_name} ({stable_confidence*100:.0f}% agreement)"
                     status_color = (0, 255, 0) if stable_label == 1 else (0, 0, 255)
-                    if stable_label == 0:
-                        # Override-driven messages first (leg-lift, ankle-height,
-                        # etc.) - these catch failures angle thresholds alone
-                        # can't, and were previously only visible in the tiny
-                        # "Raw:" line at the top, easy to miss.
-                        joint_messages = get_override_messages(override_reasons)
-                        joint_messages += get_joint_violation_messages(pose_name, feature_values)
-                        joint_messages = joint_messages[:MAX_JOINT_MESSAGES]
+
+                if voice is not None:
+                    top_message = joint_messages[0] if joint_messages else None
+                    voice.update(top_message, is_correct=(stable_label == 1))
 
                 y = 90
                 for feat, val in zip(feature_order, feature_row):
@@ -965,11 +1128,15 @@ def main():
 
     cap.release()
     cv2.destroyAllWindows()
+    if voice is not None:
+        voice.stop()
+
 
 if __name__ == "__main__":
     if os.environ.get("RUN_SCREENSHOT_TESTS") == "1":
         run_screenshot_regression_tests()
         run_joint_violation_tests()
         run_override_message_wiring_tests()
+        run_voice_feedback_tests()
     else:
         main()
