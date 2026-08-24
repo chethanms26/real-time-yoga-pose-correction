@@ -408,11 +408,6 @@ def bhujangasana_standing_override(feature_values):
 
 
 def vrikshasana_arms_down_override(feature_values):
-    # Both arms must be raised overhead - if EITHER arm is down, it's not
-    # the pose. Previously used "and" here, which only caught the case
-    # where both arms were down and let a one-arm-raised pose slip through
-    # to the raw ML model (which hadn't reliably seen that asymmetric case
-    # and sometimes still called it Correct).
     return (
         feature_values["left_shoulder"] < VRIKSHASANA_RAISED_SHOULDER_MIN or
         feature_values["right_shoulder"] < VRIKSHASANA_RAISED_SHOULDER_MIN
@@ -420,8 +415,6 @@ def vrikshasana_arms_down_override(feature_values):
 
 
 def tadasana_arms_down_override(feature_values):
-    # Same fix as Vrikshasana above - either arm down should fail the pose,
-    # not just both arms down.
     return (
         feature_values["left_shoulder"] < TADASANA_RAISED_SHOULDER_MIN or
         feature_values["right_shoulder"] < TADASANA_RAISED_SHOULDER_MIN
@@ -462,10 +455,6 @@ def apply_pose_safety_overrides(pose_name, prediction, raw_confidence, feature_v
     return prediction, raw_confidence, "", []
 
 
-# Human-readable correction cues for override reasons (v7). These fire
-# independently of get_joint_violation_messages's angle thresholds, since
-# the overrides catch failures (e.g. AC leg-lift / ankle-height) that
-# angle thresholds alone can't reliably detect - see module docstring.
 OVERRIDE_REASON_MESSAGES = {
     "standing posture": "You're still standing - lie down or lower into the pose",
     "hands not raised": "Lift both arms up overhead",
@@ -478,19 +467,7 @@ def get_override_messages(reasons):
     return [OVERRIDE_REASON_MESSAGES[r] for r in reasons if r in OVERRIDE_REASON_MESSAGES]
 
 
-# ---------------------------------------------------------------
-# JOINT-VIOLATION MESSAGES (v7)
-# ---------------------------------------------------------------
-# A joint angle increasing always means "straighter/more extended" and
-# decreasing always means "more bent/folded" - true for knee, hip, and
-# (with elbow-shoulder-hip as the vertex) shoulder too, where a bigger
-# angle means the arm is raised further away from the torso. This lets a
-# single pair of directional messages cover every joint without needing
-# to special-case what "straighten" means per pose.
-
 def _knee_or_hip_message(side, part, actual, low, high):
-    """part is 'knee' or 'hip' - kept plain and consistent everywhere,
-    no 'standing'/'lifted' jargon in the displayed text."""
     if actual < low - JOINT_MESSAGE_DEADBAND:
         deviation = low - actual
         if part == "knee":
@@ -534,16 +511,6 @@ def _simple_pose_violations(feature_values, ranges):
 
 
 def _bhujangasana_violations(feature_values):
-    """
-    Cobra pose is done lying face-down. When the body still reads as
-    standing (knee AND hip both extended, like Tadasana), the knee/hip
-    angles come from camera foreshortening on a lying-down body and don't
-    translate into meaningful "bend your knee" advice - the real problem
-    is the person isn't lying down at all. Give a plain posture-level
-    instruction in that case instead of a confusing joint-bend message.
-    Once genuinely prone, the only reliable, physically meaningful signal
-    left is the shoulder angle (how much the chest is pressed up).
-    """
     knee_avg = (feature_values["left_knee"] + feature_values["right_knee"]) / 2
     hip_avg = (feature_values["left_hip"] + feature_values["right_hip"]) / 2
     if knee_avg > 165 and hip_avg > 150:
@@ -562,7 +529,6 @@ def _bhujangasana_violations(feature_values):
 
 
 def _role_split(feature_values):
-    """Return (standing_side, standing_knee, lifted_knee, standing_hip, lifted_hip)."""
     left_knee = feature_values["left_knee"]
     right_knee = feature_values["right_knee"]
     if left_knee >= right_knee:
@@ -571,11 +537,6 @@ def _role_split(feature_values):
 
 
 def get_joint_violation_messages(pose_name, feature_values):
-    """
-    Only meaningful once the STABLE prediction is Incorrect - callers should
-    gate on tracker.stable_label == 0 before displaying these, so messages
-    don't flicker frame-to-frame the way raw predictions can.
-    """
     candidates = []
 
     if pose_name == "Tadasana":
@@ -608,9 +569,6 @@ def get_joint_violation_messages(pose_name, feature_values):
         lk_low, lk_high = ARDHA_CHANDRASANA_ROLE_RANGES["lifted_knee"]
         candidates.append(_knee_or_hip_message(standing_side, "knee", standing_knee, sk_low, sk_high))
         candidates.append(_knee_or_hip_message(lifted_side, "knee", lifted_knee, lk_low, lk_high))
-        # Hip intentionally omitted - see module docstring. The existing
-        # leg-lift / ankle-height overrides already report "leg not
-        # lifted" / "both feet grounded" for that class of error.
 
     return _rank_and_trim(candidates)
 
@@ -677,14 +635,6 @@ def run_screenshot_regression_tests():
 
 
 def run_joint_violation_tests():
-    """
-    Synthetic regression tests for the v7 joint-violation-message layer.
-    Each case starts from a realistic in-range profile for that pose (drawn
-    from the median of the raw correct_<pose>.csv) and perturbs exactly ONE
-    joint outside its threshold, then checks the expected joint/side is
-    named in the resulting message. This directly tests "does the message
-    point at the actual broken joint", not just "is a message produced".
-    """
     cases = [
         (
             "Tadasana: left knee bent, should flag left knee",
@@ -764,13 +714,6 @@ def run_joint_violation_tests():
 
 
 def run_override_message_wiring_tests():
-    """
-    Regression test for the bug found via live testing: Ardha Chandrasana
-    failures caught by the leg-lift / ankle-height OVERRIDES (not by angle
-    thresholds) must still produce a visible message, even though
-    get_joint_violation_messages deliberately skips AC hip. Confirms the
-    override reason actually reaches the display list.
-    """
     cases = [
         (
             "AC leg-lift override reason produces a display message",
@@ -799,22 +742,8 @@ def run_override_message_wiring_tests():
         raise AssertionError("One or more override-message wiring tests failed.")
 
 
-# ---------------------------------------------------------------
-# VOICE FEEDBACK (v7)
-# ---------------------------------------------------------------
 class VoiceFeedback:
-    """
-    Speaks the current top correction message aloud, off the main video
-    thread so speech never blocks frame processing (pyttsx3's runAndWait()
-    blocks the calling thread until speech finishes).
-
-    Debouncing: only queues NEW speech when the text actually changes, or
-    the same message has been showing for longer than REPEAT_AFTER seconds
-    (a standing reminder if you haven't fixed it yet). Without this, a
-    message that's technically re-selected every frame (see the raw-frame
-    sync fix) would try to speak dozens of times a second.
-    """
-    REPEAT_AFTER = 6.0  # seconds before repeating an unresolved correction
+    REPEAT_AFTER = 6.0
 
     def __init__(self):
         self.engine = pyttsx3.init()
@@ -834,8 +763,6 @@ class VoiceFeedback:
             self.engine.runAndWait()
 
     def update(self, top_message, is_correct):
-        """Call once per frame with the current top correction message
-        (or None) and whether the stable verdict is currently Correct."""
         now = time.time()
 
         if is_correct:
@@ -858,11 +785,45 @@ class VoiceFeedback:
         self._queue.put(None)
 
 
+def run_instant_verdict_tests():
+    """
+    InstantVerdict is what the big Correct/Incorrect banner uses now
+    (replacing the old 6-frame StabilityTracker for display) - the actual
+    fix for the "syncing" complaint. Confirms it needs 3 agreeing frames
+    (not 6), and correctly shows nothing when frames disagree.
+    """
+    passed = True
+
+    v = InstantVerdict()
+    v.update(1, 0.9)
+    label, conf = v.update(1, 0.9)
+    ok = label is None
+    passed = passed and ok
+    print(f"Two frames -> no verdict yet (needs 3 agreeing): {'PASS' if ok else 'FAIL'} -> {label}")
+
+    label, conf = v.update(1, 0.9)
+    ok = label == 1
+    passed = passed and ok
+    print(f"Three agreeing frames -> Correct confirmed: {'PASS' if ok else 'FAIL'} -> {label}")
+
+    label, conf = v.update(0, 0.8)
+    ok = label is None
+    passed = passed and ok
+    print(f"Single disagreeing frame after Correct -> back to no verdict (not stuck stale): {'PASS' if ok else 'FAIL'} -> {label}")
+
+    v2 = InstantVerdict()
+    v2.update(0, 0.8)
+    v2.update(0, 0.8)
+    label, conf = v2.update(0, 0.8)
+    ok = label == 0
+    passed = passed and ok
+    print(f"Three agreeing Incorrect frames -> Incorrect confirmed: {'PASS' if ok else 'FAIL'} -> {label}")
+
+    if not passed:
+        raise AssertionError("One or more InstantVerdict tests failed.")
+
+
 def run_voice_feedback_tests():
-    """
-    VoiceFeedback debounce logic tested without touching pyttsx3/audio -
-    swap the queue for a plain list so this runs in TEST_MODE too.
-    """
     class FakeVoice(VoiceFeedback):
         def __init__(self):
             self.spoken = []
@@ -961,6 +922,49 @@ class StabilityTracker:
         self.stable_confidence = 0.0
 
 
+class InstantVerdict:
+    """
+    v7 - the big Correct/Incorrect banner used to wait on StabilityTracker's
+    6-frame window, which was the actual "syncing" complaint: it lagged
+    behind what you were doing right now, and stayed on a stale verdict for
+    a moment after you moved. This tracks the last CONFIRM_FRAMES frames
+    instead - much faster than the old window, but not fully raw either, so
+    a single one-off misread (a MediaPipe jitter, a blink of bad landmark
+    detection) doesn't flash the wrong verdict for one frame.
+
+    Honest limit: if the underlying model itself is genuinely near 50/50
+    confident on a specific body position (raw confidence flipping between
+    ~55-60% for BOTH labels frame to frame - seen live on an Ardha
+    Chandrasana pose that looked nearly identical between frames but scored
+    89% Incorrect then 57% Correct), no amount of frame-window tuning fully
+    removes the flicker - that's model calibration on a boundary case, not
+    a display/sync bug. CONFIRM_FRAMES trades speed for stability; raise it
+    if flicker is still too distracting, at the cost of a slightly slower
+    verdict.
+    """
+    CONFIRM_FRAMES = 3
+
+    def __init__(self):
+        self.window = deque(maxlen=self.CONFIRM_FRAMES)
+        self.label = None
+        self.confidence = 0.0
+
+    def update(self, prediction, confidence):
+        self.window.append((prediction, confidence))
+        if len(self.window) == self.CONFIRM_FRAMES and all(p == prediction for p, _ in self.window):
+            self.label = prediction
+            self.confidence = sum(c for _, c in self.window) / len(self.window)
+        else:
+            self.label = None
+            self.confidence = 0.0
+        return self.label, self.confidence
+
+    def reset(self):
+        self.window.clear()
+        self.label = None
+        self.confidence = 0.0
+
+
 def main():
     import time
     t0 = time.time()
@@ -972,6 +976,7 @@ def main():
     print(f"[timing] pose selection + model load: {time.time() - t0:.1f}s")
 
     tracker = StabilityTracker()
+    verdict = InstantVerdict()
     missing_frame_count = 0
 
     try:
@@ -1035,7 +1040,9 @@ def main():
                 raw_status_text = f"Raw: {raw_label} ({raw_confidence*100:.0f}%){override_note}"
 
                 stable_label, stable_confidence = tracker.update(prediction, raw_confidence)
+                verdict_label, verdict_confidence = verdict.update(prediction, raw_confidence)
 
+                joint_messages = []
                 # Joint-violation / override messages are driven by the RAW,
                 # current-frame prediction - not stable_label. stable_label is
                 # smoothed over several frames on purpose (to stop the big
@@ -1043,23 +1050,28 @@ def main():
                 # made the coaching messages feel late or missing entirely
                 # during "Analyzing...". The messages below now always match
                 # what you're doing on THIS frame.
-                joint_messages = []
                 if prediction == 0:
                     joint_messages = get_override_messages(override_reasons)
                     joint_messages += get_joint_violation_messages(pose_name, feature_values)
                     joint_messages = joint_messages[:MAX_JOINT_MESSAGES]
 
-                if stable_label is None:
-                    stable_status_text = "Analyzing..."
+                # The big banner now follows InstantVerdict (near-instant,
+                # 2-frame confirm) instead of the old 6-frame
+                # StabilityTracker - that lag was the actual "syncing"
+                # complaint. StabilityTracker is still computed above and
+                # available for future use (e.g. session-logging accuracy
+                # stats) but no longer gates what's shown on screen.
+                if verdict_label is None:
+                    stable_status_text = "..."
                     status_color = (200, 200, 200)
                 else:
-                    label_name = "Correct" if stable_label == 1 else "Incorrect"
-                    stable_status_text = f"{label_name} ({stable_confidence*100:.0f}% agreement)"
-                    status_color = (0, 255, 0) if stable_label == 1 else (0, 0, 255)
+                    label_name = "Correct" if verdict_label == 1 else "Incorrect"
+                    stable_status_text = f"{label_name} ({verdict_confidence*100:.0f}%)"
+                    status_color = (0, 255, 0) if verdict_label == 1 else (0, 0, 255)
 
                 if voice is not None:
                     top_message = joint_messages[0] if joint_messages else None
-                    voice.update(top_message, is_correct=(stable_label == 1))
+                    voice.update(top_message, is_correct=(verdict_label == 1))
 
                 y = 90
                 for feat, val in zip(feature_order, feature_row):
@@ -1068,12 +1080,33 @@ def main():
                     y += 20
 
                 if pose_name == "Bhujangasana":
-                    # Diagnostic only - not used in any decision yet. Print
-                    # lower-body landmark visibility to check whether "legs
-                    # go out of frame / low visibility when genuinely lying
-                    # down for Cobra" actually holds on this camera setup.
                     vis = get_lower_body_visibility(landmarks)
                     cv2.putText(frame, f"[diag] visibility: {vis}", (20, y),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 200), 1)
+                    y += 20
+
+                if pose_name == "Ardha Chandrasana":
+                    # Diagnostic only - shows exactly what the leg-lift and
+                    # ankle-height override checks are computing this frame,
+                    # so a "bent forward but neither leg lifted, still shows
+                    # Correct" report can be pinned to an actual cause: the
+                    # leg-lift angle being fooled by torso bend, vs. a check
+                    # silently skipping because a landmark's visibility is
+                    # too low to trust.
+                    leg_lift_diag = get_leg_lift_angles(landmarks)
+                    ankle_diag = get_ankle_height_diff(landmarks)
+                    # Round to 1 decimal and build a short plain string -
+                    # printing the dict directly showed raw numpy.float64
+                    # repr with 15+ decimal places and ran off the screen.
+                    leg_lift_text = ", ".join(
+                        f"{name.replace('_leg_lift', '')}: {float(val):.1f}"
+                        for name, val in leg_lift_diag.items()
+                    ) or "n/a"
+                    cv2.putText(frame, f"[diag] leg-lift angles: {leg_lift_text}", (20, y),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 200), 1)
+                    y += 20
+                    ankle_text = "n/a (landmarks not confident)" if ankle_diag is None else f"{ankle_diag:.2f}"
+                    cv2.putText(frame, f"[diag] ankle-height-diff: {ankle_text}", (20, y),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 200), 1)
                     y += 20
             else:
@@ -1084,14 +1117,15 @@ def main():
                     raw_status_text = "Raw: Correct (85%) [upper-body fallback]"
 
                     stable_label, stable_confidence = tracker.update(prediction, raw_confidence)
+                    verdict_label, verdict_confidence = verdict.update(prediction, raw_confidence)
 
-                    if stable_label is None:
-                        stable_status_text = "Analyzing..."
+                    if verdict_label is None:
+                        stable_status_text = "..."
                         status_color = (200, 200, 200)
                     else:
-                        label_name = "Correct" if stable_label == 1 else "Incorrect"
-                        stable_status_text = f"{label_name} ({stable_confidence*100:.0f}% agreement)"
-                        status_color = (0, 255, 0) if stable_label == 1 else (0, 0, 255)
+                        label_name = "Correct" if verdict_label == 1 else "Incorrect"
+                        stable_status_text = f"{label_name} ({verdict_confidence*100:.0f}%)"
+                        status_color = (0, 255, 0) if verdict_label == 1 else (0, 0, 255)
                 else:
                     missing_frame_count += 1
                     raw_status_text = "Landmarks visible, angle joints incomplete"
@@ -1099,6 +1133,7 @@ def main():
                     status_color = (0, 165, 255)
                     if missing_frame_count >= MISSING_FRAME_LIMIT:
                         tracker.reset()
+                        verdict.reset()
 
             for i in range(11, 33):
                 if landmarks[i].visibility > 0.2:
@@ -1109,6 +1144,7 @@ def main():
             missing_frame_count += 1
             if missing_frame_count >= MISSING_FRAME_LIMIT:
                 tracker.reset()
+                verdict.reset()
 
         cv2.putText(frame, f"Pose: {pose_name}", (20, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
@@ -1137,6 +1173,7 @@ if __name__ == "__main__":
         run_screenshot_regression_tests()
         run_joint_violation_tests()
         run_override_message_wiring_tests()
+        run_instant_verdict_tests()
         run_voice_feedback_tests()
     else:
         main()
