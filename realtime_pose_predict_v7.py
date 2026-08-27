@@ -457,14 +457,38 @@ def apply_pose_safety_overrides(pose_name, prediction, raw_confidence, feature_v
 
 OVERRIDE_REASON_MESSAGES = {
     "standing posture": "You're still standing - lie down or lower into the pose",
-    "hands not raised": "Lift both arms up overhead",
     "leg not lifted": "Lift your leg higher off the ground",
     "both feet grounded": "Lift one leg off the ground",
 }
 
 
-def get_override_messages(reasons):
-    return [OVERRIDE_REASON_MESSAGES[r] for r in reasons if r in OVERRIDE_REASON_MESSAGES]
+def get_arms_message(feature_values, min_threshold):
+    """
+    "hands not raised" used to say the same generic "Lift both arms up
+    overhead" whether BOTH arms were down or just ONE was - confusing when
+    you'd already raised one arm correctly and got told to lift "both"
+    again. Now checks each side and names the specific arm that's still
+    down, for both Vrikshasana and Tadasana (they share this same check).
+    """
+    left_down = feature_values["left_shoulder"] < min_threshold
+    right_down = feature_values["right_shoulder"] < min_threshold
+    if left_down and right_down:
+        return "Lift both arms up overhead"
+    if left_down:
+        return "Your right arm's up - lift your left arm too"
+    if right_down:
+        return "Your left arm's up - lift your right arm too"
+    return "Lift both arms up overhead"  # fallback, shouldn't normally hit
+
+
+def get_override_messages(reasons, feature_values=None, arm_threshold=None):
+    messages = []
+    for r in reasons:
+        if r == "hands not raised" and feature_values is not None and arm_threshold is not None:
+            messages.append(get_arms_message(feature_values, arm_threshold))
+        elif r in OVERRIDE_REASON_MESSAGES:
+            messages.append(OVERRIDE_REASON_MESSAGES[r])
+    return messages
 
 
 def _knee_or_hip_message(side, part, actual, low, high):
@@ -742,6 +766,40 @@ def run_override_message_wiring_tests():
         raise AssertionError("One or more override-message wiring tests failed.")
 
 
+def run_arms_message_tests():
+    """
+    "hands not raised" used to say the same generic "Lift both arms up
+    overhead" regardless of whether one or both arms were actually down -
+    confusing when you'd already raised one arm. This checks the specific,
+    correct message comes back for each case, for both poses that share
+    this check.
+    """
+    cases = [
+        ("Vrikshasana: both arms down", "Vrikshasana", VRIKSHASANA_RAISED_SHOULDER_MIN,
+         {"left_shoulder": 20.0, "right_shoulder": 20.0}, "Lift both arms up overhead"),
+        ("Vrikshasana: only left arm down", "Vrikshasana", VRIKSHASANA_RAISED_SHOULDER_MIN,
+         {"left_shoulder": 20.0, "right_shoulder": 170.0}, "left arm too"),
+        ("Vrikshasana: only right arm down", "Vrikshasana", VRIKSHASANA_RAISED_SHOULDER_MIN,
+         {"left_shoulder": 170.0, "right_shoulder": 20.0}, "right arm too"),
+        ("Tadasana: both arms down", "Tadasana", TADASANA_RAISED_SHOULDER_MIN,
+         {"left_shoulder": 15.0, "right_shoulder": 15.0}, "Lift both arms up overhead"),
+        ("Tadasana: only left arm down", "Tadasana", TADASANA_RAISED_SHOULDER_MIN,
+         {"left_shoulder": 15.0, "right_shoulder": 175.0}, "left arm too"),
+        ("Tadasana: only right arm down", "Tadasana", TADASANA_RAISED_SHOULDER_MIN,
+         {"left_shoulder": 175.0, "right_shoulder": 15.0}, "right arm too"),
+    ]
+
+    passed = True
+    for name, pose_name, threshold, feature_values, expected_substring in cases:
+        messages = get_override_messages(["hands not raised"], feature_values, threshold)
+        ok = len(messages) == 1 and expected_substring in messages[0]
+        passed = passed and ok
+        print(f"{name}: {'PASS' if ok else 'FAIL'} -> {messages}")
+
+    if not passed:
+        raise AssertionError("One or more arms-message tests failed.")
+
+
 class VoiceFeedback:
     REPEAT_AFTER = 6.0
 
@@ -999,12 +1057,21 @@ def main():
     cv2.resizeWindow(WINDOW_NAME, 1280, 720)
     print(f"[timing] total time to window open: {time.time() - t0:.1f}s\n")
 
-    print("\nStarting webcam. Press 'q' to quit.\n")
+    print("\nStarting webcam. Press 'q' to quit, 'd' to toggle the debug overlay.\n")
     if is_ardha_chandrasana:
         print(f"Safety checks active: leg-lift (max {LEG_LIFT_MAX_FOR_CORRECT} deg), "
               f"ankle-height-diff (min {ANKLE_HEIGHT_DIFF_MIN_FOR_CORRECT})\n")
 
+    fps_frame_times = deque(maxlen=30)  # rolling average over the last 30 frames
+    current_fps = 0.0
+    show_debug = False  # off by default - the 9+ lines of angle values and
+                         # diagnostics were covering most of the webcam feed.
+                         # Press 'd' during a session to bring them back when
+                         # actually debugging (e.g. the Ardha Chandrasana
+                         # leg-lift/ankle-height numbers).
+
     while True:
+        frame_start = time.time()
         ret, frame = cap.read()
         if not ret:
             break
@@ -1051,7 +1118,10 @@ def main():
                 # during "Analyzing...". The messages below now always match
                 # what you're doing on THIS frame.
                 if prediction == 0:
-                    joint_messages = get_override_messages(override_reasons)
+                    arm_threshold = (VRIKSHASANA_RAISED_SHOULDER_MIN if pose_name == "Vrikshasana"
+                                      else TADASANA_RAISED_SHOULDER_MIN if pose_name == "Tadasana"
+                                      else None)
+                    joint_messages = get_override_messages(override_reasons, feature_values, arm_threshold)
                     joint_messages += get_joint_violation_messages(pose_name, feature_values)
                     joint_messages = joint_messages[:MAX_JOINT_MESSAGES]
 
@@ -1074,41 +1144,42 @@ def main():
                     voice.update(top_message, is_correct=(verdict_label == 1))
 
                 y = 90
-                for feat, val in zip(feature_order, feature_row):
-                    cv2.putText(frame, f"{feat}: {val:.1f}", (20, y),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                    y += 20
+                if show_debug:
+                    for feat, val in zip(feature_order, feature_row):
+                        cv2.putText(frame, f"{feat}: {val:.1f}", (20, y),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                        y += 20
 
-                if pose_name == "Bhujangasana":
-                    vis = get_lower_body_visibility(landmarks)
-                    cv2.putText(frame, f"[diag] visibility: {vis}", (20, y),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 200), 1)
-                    y += 20
+                    if pose_name == "Bhujangasana":
+                        vis = get_lower_body_visibility(landmarks)
+                        cv2.putText(frame, f"[diag] visibility: {vis}", (20, y),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 200), 1)
+                        y += 20
 
-                if pose_name == "Ardha Chandrasana":
-                    # Diagnostic only - shows exactly what the leg-lift and
-                    # ankle-height override checks are computing this frame,
-                    # so a "bent forward but neither leg lifted, still shows
-                    # Correct" report can be pinned to an actual cause: the
-                    # leg-lift angle being fooled by torso bend, vs. a check
-                    # silently skipping because a landmark's visibility is
-                    # too low to trust.
-                    leg_lift_diag = get_leg_lift_angles(landmarks)
-                    ankle_diag = get_ankle_height_diff(landmarks)
-                    # Round to 1 decimal and build a short plain string -
-                    # printing the dict directly showed raw numpy.float64
-                    # repr with 15+ decimal places and ran off the screen.
-                    leg_lift_text = ", ".join(
-                        f"{name.replace('_leg_lift', '')}: {float(val):.1f}"
-                        for name, val in leg_lift_diag.items()
-                    ) or "n/a"
-                    cv2.putText(frame, f"[diag] leg-lift angles: {leg_lift_text}", (20, y),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 200), 1)
-                    y += 20
-                    ankle_text = "n/a (landmarks not confident)" if ankle_diag is None else f"{ankle_diag:.2f}"
-                    cv2.putText(frame, f"[diag] ankle-height-diff: {ankle_text}", (20, y),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 200), 1)
-                    y += 20
+                    if pose_name == "Ardha Chandrasana":
+                        # Diagnostic only - shows exactly what the leg-lift and
+                        # ankle-height override checks are computing this frame,
+                        # so a "bent forward but neither leg lifted, still shows
+                        # Correct" report can be pinned to an actual cause: the
+                        # leg-lift angle being fooled by torso bend, vs. a check
+                        # silently skipping because a landmark's visibility is
+                        # too low to trust.
+                        leg_lift_diag = get_leg_lift_angles(landmarks)
+                        ankle_diag = get_ankle_height_diff(landmarks)
+                        # Round to 1 decimal and build a short plain string -
+                        # printing the dict directly showed raw numpy.float64
+                        # repr with 15+ decimal places and ran off the screen.
+                        leg_lift_text = ", ".join(
+                            f"{name.replace('_leg_lift', '')}: {float(val):.1f}"
+                            for name, val in leg_lift_diag.items()
+                        ) or "n/a"
+                        cv2.putText(frame, f"[diag] leg-lift angles: {leg_lift_text}", (20, y),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 200), 1)
+                        y += 20
+                        ankle_text = "n/a (landmarks not confident)" if ankle_diag is None else f"{ankle_diag:.2f}"
+                        cv2.putText(frame, f"[diag] ankle-height-diff: {ankle_text}", (20, y),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 200), 1)
+                        y += 20
             else:
                 if pose_name == "Bhujangasana" and bhujangasana_upper_body_fallback(landmarks):
                     missing_frame_count = 0
@@ -1150,6 +1221,9 @@ def main():
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
         cv2.putText(frame, raw_status_text, (20, 55),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+        if not show_debug:
+            cv2.putText(frame, "Press 'd' for debug info", (20, 75),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (140, 140, 140), 1)
         cv2.putText(frame, stable_status_text, (20, frame.shape[0] - 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
 
@@ -1157,10 +1231,30 @@ def main():
             cv2.putText(frame, msg, (20, frame.shape[0] - 50 - (i * 25)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 165, 255), 1)
 
+        # Live FPS + derived sync-time readout - answers "what's the actual
+        # syncing time on my machine" with a real measured number instead of
+        # an estimate. fps_frame_times holds the last 30 per-frame durations;
+        # current_fps is their rolling average. Messages update every frame
+        # (1 frame delay); the banner needs 3 agreeing frames (see
+        # InstantVerdict) - both converted to milliseconds here.
+        fps_frame_times.append(time.time() - frame_start)
+        if fps_frame_times:
+            avg_frame_time = sum(fps_frame_times) / len(fps_frame_times)
+            current_fps = 1.0 / avg_frame_time if avg_frame_time > 0 else 0.0
+        message_delay_ms = (1000.0 / current_fps) if current_fps > 0 else 0.0
+        banner_delay_ms = message_delay_ms * InstantVerdict.CONFIRM_FRAMES
+        fps_text = (f"FPS: {current_fps:.0f}  |  messages: ~{message_delay_ms:.0f}ms  |  "
+                    f"banner: ~{banner_delay_ms:.0f}ms")
+        cv2.putText(frame, fps_text, (frame.shape[1] - 480, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
         cv2.imshow(WINDOW_NAME, frame)
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
             break
+        if key == ord('d'):
+            show_debug = not show_debug
 
     cap.release()
     cv2.destroyAllWindows()
@@ -1173,6 +1267,7 @@ if __name__ == "__main__":
         run_screenshot_regression_tests()
         run_joint_violation_tests()
         run_override_message_wiring_tests()
+        run_arms_message_tests()
         run_instant_verdict_tests()
         run_voice_feedback_tests()
     else:
