@@ -500,7 +500,7 @@ def _knee_or_hip_message(side, part, actual, low, high):
     if actual > high + JOINT_MESSAGE_DEADBAND:
         deviation = actual - high
         if part == "knee":
-            return (f"Bend your {side} knee a little", deviation)
+            return (f"Fold your {side} knee a little", deviation)
         return (f"Bend forward a little more at your {side} hip", deviation)
     return None
 
@@ -535,10 +535,30 @@ def _simple_pose_violations(feature_values, ranges):
 
 
 def _bhujangasana_violations(feature_values):
+    """
+    Cobra pose is done lying face-down. When the body still reads as
+    standing (knee AND hip both extended, like Tadasana), give a plain
+    posture-level instruction instead of a confusing joint-bend message -
+    the real problem is the person isn't lying down at all. Once genuinely
+    prone, the only reliable signal left is the shoulder angle (how much
+    the chest is pressed up) - and the message for that stage explicitly
+    says "you're lying down" first, so it's clear that part is already
+    right and the remaining issue is just the chest lift, not a totally
+    different instruction to restart from.
+    """
     knee_avg = (feature_values["left_knee"] + feature_values["right_knee"]) / 2
     hip_avg = (feature_values["left_hip"] + feature_values["right_hip"]) / 2
+    # Reverted to (165, 150) - these were confirmed against the actual
+    # screenshot 602 bug report (standing bent-forward: knee~178, hip~165)
+    # and against genuine lying-down data (knee~150-156, hip~138-141). A
+    # later widening to (170, 165), made without new debug evidence to
+    # justify it, silently broke the screenshot 602 regression test - it
+    # no longer classified that exact case as "not lying down". Reverting
+    # until there's an actual confirmed case showing (165, 150) misfires on
+    # a genuinely prone pose - see the request for real debug numbers
+    # before changing this again.
     if knee_avg > 165 and hip_avg > 150:
-        return ["Lie down on your stomach, then lift your chest up"]
+        return ["Lie face-down on the floor for Cobra pose"]
 
     l_low, l_high = BHUJANGASANA_JOINT_RANGES["left_shoulder"]
     r_low, r_high = BHUJANGASANA_JOINT_RANGES["right_shoulder"]
@@ -546,9 +566,9 @@ def _bhujangasana_violations(feature_values):
     right_val = feature_values["right_shoulder"]
 
     if left_val < l_low - JOINT_MESSAGE_DEADBAND or right_val < r_low - JOINT_MESSAGE_DEADBAND:
-        return ["Push up a little more and lift your chest higher"]
+        return ["You're lying down - now press up and lift your chest a little higher"]
     if left_val > l_high + JOINT_MESSAGE_DEADBAND or right_val > r_high + JOINT_MESSAGE_DEADBAND:
-        return ["Don't push up so high - relax a little"]
+        return ["You're lying down and lifted well - just ease back a little, don't push up so far"]
     return []
 
 
@@ -679,21 +699,21 @@ def run_joint_violation_tests():
             "Bhujangasana",
             {"left_knee": 150.0, "right_knee": 150.0, "left_hip": 140.0,
              "right_hip": 140.0, "left_shoulder": 10.0, "right_shoulder": 10.0},
-            ["chest higher"],
+            ["lift your chest"],
         ),
         (
             "Bhujangasana: pressed up too far while lying down, expect ease-back cue",
             "Bhujangasana",
             {"left_knee": 150.0, "right_knee": 150.0, "left_hip": 140.0,
              "right_hip": 140.0, "left_shoulder": 30.0, "right_shoulder": 90.0},
-            ["Don't push up"],
+            ["ease back"],
         ),
         (
             "Bhujangasana: still standing/bent-forward (not lying down), expect lie-down cue not knee-bend advice",
             "Bhujangasana",
             {"left_knee": 178.0, "right_knee": 179.0, "left_hip": 171.6,
              "right_hip": 157.6, "left_shoulder": 8.8, "right_shoulder": 19.9},
-            ["Lie down"],
+            ["Lie face-down"],
         ),
         (
             "Trikonasana: right hip not folded enough, flag right hip",
@@ -801,13 +821,50 @@ def run_arms_message_tests():
 
 
 class VoiceFeedback:
+    """
+    Speaks each current correction as a SEPARATE utterance, one after
+    another with a natural pause between them - off the main video thread
+    so speech never blocks frame processing (pyttsx3's runAndWait() blocks
+    the calling thread until speech finishes).
+
+    An earlier version joined multiple corrections into one long sentence
+    ("Straighten your left leg and lift your right arm higher") so both
+    got announced - but that meant everything came out in one run-on burst
+    the moment two things were wrong at once, which felt like a dump of
+    instructions rather than guidance. Queuing them as separate utterances
+    instead means they play one at a time, like distinct suggestions, with
+    the TTS engine's normal gap between sentences.
+
+    Debouncing: only queues NEW speech when the SET of messages actually
+    changes, or the same set has been showing for longer than REPEAT_AFTER
+    seconds (a standing reminder if you haven't fixed it yet).
+
+    Backlog prevention: if the message set changed again before the
+    previous one finished playing, an earlier version just added the new
+    sentences to the end of the queue - so a few quick corrections would
+    all play back-to-back, well after you'd already moved past them.
+    update() drains any not-yet-spoken items before queuing the new set,
+    so you're never stuck listening to stale corrections.
+
+    Engine lifetime - IMPORTANT, learned the hard way: a later attempt
+    switched to creating a brand-new pyttsx3 engine for every sentence,
+    guessing that would avoid slowdown from reusing one engine. On Windows
+    (SAPI5), calling pyttsx3.init() more than once in the same process is
+    known to frequently break after the first call - which is exactly what
+    happened live ("voice comes once, then never again"). Reverted to a
+    SINGLE engine created once in __init__ and reused for every utterance -
+    this is the configuration that was actually confirmed working before
+    later changes broke it. No cross-thread engine.stop() call either
+    (also unreliable) - the queue-draining above is what prevents backlog,
+    and is enough on its own.
+    """
     REPEAT_AFTER = 6.0
 
     def __init__(self):
         self.engine = pyttsx3.init()
         self.engine.setProperty("rate", 165)
         self._queue = queue.Queue()
-        self._last_text = None
+        self._last_target = None
         self._last_spoken_at = 0.0
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._thread.start()
@@ -817,29 +874,47 @@ class VoiceFeedback:
             text = self._queue.get()
             if text is None:
                 break
-            self.engine.say(text)
-            self.engine.runAndWait()
+            try:
+                self.engine.say(text)
+                self.engine.runAndWait()
+            except Exception as e:
+                print(f"[voice] speech error, skipping this line: {e}")
 
-    def update(self, top_message, is_correct):
+    def _drain_queue(self):
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def update(self, messages, is_correct):
+        """
+        `messages` is the list of current correction messages (0, 1, or 2
+        of them - same list shown on screen). Each is queued as its own
+        utterance, spoken one after another, rather than joined into one
+        sentence - see class docstring.
+        """
         now = time.time()
 
         if is_correct:
-            if self._last_text != "__correct__":
-                self._queue.put("Correct, nice job")
-                self._last_text = "__correct__"
-                self._last_spoken_at = now
-            return
+            target = ("__correct__",)
+            payload = ["Correct, nice job"]
+        else:
+            if not messages:
+                self._last_target = None
+                return
+            target = tuple(messages)
+            payload = list(messages)
 
-        if top_message is None:
-            self._last_text = None
-            return
-
-        if top_message != self._last_text or (now - self._last_spoken_at) > self.REPEAT_AFTER:
-            self._queue.put(top_message)
-            self._last_text = top_message
+        if target != self._last_target or (now - self._last_spoken_at) > self.REPEAT_AFTER:
+            self._drain_queue()
+            for text in payload:
+                self._queue.put(text)
+            self._last_target = target
             self._last_spoken_at = now
 
     def stop(self):
+        self._drain_queue()
         self._queue.put(None)
 
 
@@ -882,56 +957,93 @@ def run_instant_verdict_tests():
 
 
 def run_voice_feedback_tests():
+    """
+    Uses the REAL VoiceFeedback.update()/_drain_queue() logic (not a
+    simplified copy) so this actually exercises the sequential-speaking and
+    backlog-prevention behavior - only self._queue is faked, so nothing
+    here touches real audio hardware. "queued" reflects exactly what's
+    waiting to be spoken at any moment, the same as the live app.
+    """
+    class FakeQueue:
+        """Records everything ever put, in order - stands in for
+        queue.Queue without needing a real worker thread consuming it."""
+        def __init__(self):
+            self.items = []  # what's currently "queued" (unconsumed)
+            self.history = []  # everything ever put, for asserting order
+
+        def put(self, item):
+            self.items.append(item)
+            self.history.append(item)
+
+        def empty(self):
+            return len(self.items) == 0
+
+        def get_nowait(self):
+            if not self.items:
+                raise queue.Empty
+            return self.items.pop(0)
+
     class FakeVoice(VoiceFeedback):
         def __init__(self):
-            self.spoken = []
-            self._last_text = None
+            self._queue = FakeQueue()
+            self._last_target = None
             self._last_spoken_at = 0.0
-
-        def _speak(self, text):
-            self.spoken.append(text)
-
-        def update(self, top_message, is_correct):
-            now = time.time()
-            if is_correct:
-                if self._last_text != "__correct__":
-                    self._speak("Correct, nice job")
-                    self._last_text = "__correct__"
-                    self._last_spoken_at = now
-                return
-            if top_message is None:
-                self._last_text = None
-                return
-            if top_message != self._last_text or (now - self._last_spoken_at) > self.REPEAT_AFTER:
-                self._speak(top_message)
-                self._last_text = top_message
-                self._last_spoken_at = now
 
     passed = True
 
     v = FakeVoice()
-    v.update("Straighten your left leg", False)
-    v.update("Straighten your left leg", False)
-    v.update("Straighten your left leg", False)
-    ok = v.spoken == ["Straighten your left leg"]
+    v.update(["Straighten your left leg"], False)
+    v.update(["Straighten your left leg"], False)
+    v.update(["Straighten your left leg"], False)
+    ok = v._queue.history == ["Straighten your left leg"]
     passed = passed and ok
-    print(f"Same message repeated frames -> spoken once: {'PASS' if ok else 'FAIL'} -> {v.spoken}")
+    print(f"Same message repeated frames -> spoken once: {'PASS' if ok else 'FAIL'} -> {v._queue.history}")
 
     v = FakeVoice()
-    v.update("Straighten your left leg", False)
-    v.update("Bend your right knee a little", False)
-    ok = v.spoken == ["Straighten your left leg", "Bend your right knee a little"]
+    v.update(["Straighten your left leg", "Lift your right arm higher"], False)
+    ok = v._queue.history == ["Straighten your left leg", "Lift your right arm higher"]
     passed = passed and ok
-    print(f"Message change speaks immediately: {'PASS' if ok else 'FAIL'} -> {v.spoken}")
+    print(f"Two corrections at once -> BOTH queued as separate utterances (not joined into "
+          f"one sentence): {'PASS' if ok else 'FAIL'} -> {v._queue.history}")
 
     v = FakeVoice()
-    v.update("Straighten your left leg", False)
-    v.update(None, True)
-    v.update(None, True)
-    v.update("Straighten your left leg", False)
-    ok = v.spoken == ["Straighten your left leg", "Correct, nice job", "Straighten your left leg"]
+    v.update(["Straighten your left leg"], False)
+    v.update(["Bend your right knee a little"], False)
+    ok = v._queue.history == ["Straighten your left leg", "Bend your right knee a little"]
     passed = passed and ok
-    print(f"Correct then incorrect again re-speaks: {'PASS' if ok else 'FAIL'} -> {v.spoken}")
+    print(f"Message change speaks immediately: {'PASS' if ok else 'FAIL'} -> {v._queue.history}")
+
+    v = FakeVoice()
+    v.update(["Straighten your left leg"], False)
+    v.update(None, True)
+    v.update(None, True)
+    v.update(["Straighten your left leg"], False)
+    ok = v._queue.history == ["Straighten your left leg", "Correct, nice job", "Straighten your left leg"]
+    passed = passed and ok
+    print(f"Correct then incorrect again re-speaks: {'PASS' if ok else 'FAIL'} -> {v._queue.history}")
+
+    # The backlog bug: rapid different corrections used to all queue up and
+    # play back-to-back, well after the pose had already changed. Confirms
+    # each new message SET clears out whatever was still waiting first.
+    v = FakeVoice()
+    v.update(["Straighten your left leg"], False)
+    v.update(["Bend your right knee a little"], False)  # should drop the still-unspoken first message
+    v.update(["Lift your left arm higher"], False)       # should drop the still-unspoken second message
+    ok = v._queue.items == ["Lift your left arm higher"]
+    passed = passed and ok
+    print(f"Rapid different corrections -> no backlog, only the latest set is still queued: "
+          f"{'PASS' if ok else 'FAIL'} -> queued={v._queue.items}")
+
+    # Fixing the pose should immediately clear any pending stale correction,
+    # not wait for it to finish playing first.
+    v = FakeVoice()
+    v.update(["Straighten your left leg"], False)
+    v.update(["Bend your right knee a little"], False)
+    v.update(None, True)
+    ok = v._queue.items == ["Correct, nice job"]
+    passed = passed and ok
+    print(f"Fixing the pose clears pending corrections immediately: "
+          f"{'PASS' if ok else 'FAIL'} -> queued={v._queue.items}")
 
     if not passed:
         raise AssertionError("One or more voice-feedback debounce tests failed.")
@@ -1140,8 +1252,17 @@ def main():
                     status_color = (0, 255, 0) if verdict_label == 1 else (0, 0, 255)
 
                 if voice is not None:
-                    top_message = joint_messages[0] if joint_messages else None
-                    voice.update(top_message, is_correct=(verdict_label == 1))
+                    # is_correct MUST use the same raw `prediction` that
+                    # drives joint_messages above - not verdict_label (the
+                    # smoothed, 3-frame-confirmed banner state). Using two
+                    # different signals here was the actual cause of text
+                    # and voice occasionally disagreeing: text could clear
+                    # (raw already flipped to Correct) while voice was still
+                    # waiting on verdict_label to catch up, or vice versa.
+                    # The banner is intentionally allowed to lag (that's
+                    # what stops it flickering) - text and voice are not,
+                    # since they're meant to always describe THIS frame.
+                    voice.update(joint_messages, is_correct=(prediction == 1))
 
                 y = 90
                 if show_debug:
