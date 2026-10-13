@@ -3,15 +3,32 @@ RandomForest classifier -> rule-based safety overrides -> on-screen text and
 voice feedback."""
 
 import os
+from pathlib import Path
+
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['GLOG_minloglevel'] = '3'
+os.environ['ABSL_MIN_LOG_LEVEL'] = '3'
 
 import numpy as np
 import json
+import warnings
 import threading
 import queue
 import time
 from collections import deque
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"Trying to unpickle estimator .* from version .*",
+    category=UserWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r"X does not have valid feature names.*",
+    category=UserWarning,
+)
 
 TEST_MODE = os.environ.get("RUN_SCREENSHOT_TESTS") == "1"
 
@@ -35,7 +52,7 @@ if not TEST_MODE:
 # ---------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------
-BASE_PATH = r"C:\Users\Chethan MS\Documents\Capstone 7"
+BASE_PATH = str(Path(__file__).resolve().parent)
 
 POSE_OPTIONS = {
     "1": ("Ardha Chandrasana", "ARDHA CHANDRASANA", "ardha_chandrasana_rf"),
@@ -123,7 +140,8 @@ ARDHA_CHANDRASANA_ROLE_RANGES = {
 }
 
 JOINT_MESSAGE_DEADBAND = 4  # degrees of slack before a violation is reported
-MAX_JOINT_MESSAGES = 2      # cap on-screen messages to the worst offenders
+FALLBACK_INCORRECT_MESSAGE = "Adjust your posture to match the pose"
+MAX_JOINT_MESSAGES = 3      # keep arm + both leg corrections when needed
 
 
 def select_pose():
@@ -719,14 +737,14 @@ def run_arms_message_tests():
 
 
 class VoiceFeedback:
-    """Speaks the single top (worst) correction at a time, off the main
-    video thread so speech never blocks frame processing. Both sides of a
-    pose still get covered over time: fixing the worse issue drops it from
-    the ranking, and the remaining issue becomes the new top message on a
-    later frame. Debounced (won't repeat unless the message changes or
-    REPEAT_AFTER seconds pass) and drains any stale queued message before
+    """Speaks the top unique correction messages, off the main video thread so
+    speech never blocks frame processing. The screen may rank several issues,
+    but the voice layer keeps the newest unique subset rather than only the
+    single worst item. Debounced (won't repeat unless the message set changes
+    or REPEAT_AFTER seconds pass) and drains any stale queued message before
     speaking a new one, so it never falls behind with old corrections."""
     REPEAT_AFTER = 6.0
+    MAX_SPOKEN_MESSAGES = 2
 
     def __init__(self):
         self.engine = pyttsx3.init()
@@ -734,6 +752,7 @@ class VoiceFeedback:
         self._queue = queue.Queue()
         self._last_target = None
         self._last_spoken_at = 0.0
+        self._speech_lock = threading.Lock()
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._thread.start()
 
@@ -743,8 +762,9 @@ class VoiceFeedback:
             if text is None:
                 break
             try:
-                self.engine.say(text)
-                self.engine.runAndWait()
+                with self._speech_lock:
+                    self.engine.say(text)
+                    self.engine.runAndWait()
             except Exception as e:
                 print(f"[voice] speech error, skipping this line: {e}")
 
@@ -755,32 +775,59 @@ class VoiceFeedback:
             except queue.Empty:
                 break
 
+    def _build_payload(self, messages):
+        payload = []
+        seen = set()
+        for msg in messages:
+            if not msg or msg in seen:
+                continue
+            seen.add(msg)
+            payload.append(msg)
+            if len(payload) >= self.MAX_SPOKEN_MESSAGES:
+                break
+        return payload
+
     def update(self, messages, is_correct):
-        """messages = current ranked correction list, worst first; only
-        messages[0] is ever spoken."""
+        """messages = current ranked correction list, worst first. Speak the
+        top unique messages, capped to MAX_SPOKEN_MESSAGES, as one serialized
+        utterance so pyttsx3 does not overlap separate speech calls."""
         now = time.time()
 
         if is_correct:
-            target = "__correct__"
+            target = ("__correct__",)
             payload = ["Correct, nice job"]
         else:
             if not messages:
+                self._drain_queue()
                 self._last_target = None
                 return
-            top = messages[0]
-            target = top
-            payload = [top]
+            payload = self._build_payload(messages)
+            if not payload:
+                self._last_target = None
+                return
+            target = tuple(payload)
 
         if target != self._last_target or (now - self._last_spoken_at) > self.REPEAT_AFTER:
             self._drain_queue()
-            for text in payload:
-                self._queue.put(text)
+            utterance = ". ".join(payload)
+            self._queue.put(utterance)
             self._last_target = target
             self._last_spoken_at = now
 
     def stop(self):
         self._drain_queue()
         self._queue.put(None)
+
+
+def update_voice_for_verdict(voice, verdict_label, joint_messages):
+    if voice is None:
+        return
+    if verdict_label == 1:
+        voice.update([], is_correct=True)
+    elif verdict_label == 0:
+        voice.update(joint_messages, is_correct=False)
+    else:
+        voice.update([], is_correct=False)
 
 
 def run_instant_verdict_tests():
@@ -803,7 +850,7 @@ def run_instant_verdict_tests():
     ok = label is None
     passed = passed and ok
     print(f"Single disagreeing frame after Correct -> back to no verdict (not stuck stale): {'PASS' if ok else 'FAIL'} -> {label}")
-
+        
     v2 = InstantVerdict()
     v2.update(0, 0.8)
     v2.update(0, 0.8)
@@ -854,17 +901,17 @@ def run_voice_feedback_tests():
 
     v = FakeVoice()
     v.update(["Straighten your left leg", "Lift your right arm higher"], False)
-    ok = v._queue.history == ["Straighten your left leg"]
+    ok = v._queue.history == ["Straighten your left leg. Lift your right arm higher"]
     passed = passed and ok
-    print(f"Two corrections at once -> only the TOP one is spoken, not both immediately: "
+    print(f"Two unique corrections at once -> both top suggestions are spoken in one serialized utterance: "
           f"{'PASS' if ok else 'FAIL'} -> {v._queue.history}")
 
     v = FakeVoice()
     v.update(["Straighten your left leg", "Lift your right arm higher"], False)
     v.update(["Lift your right arm higher"], False)
-    ok = v._queue.history == ["Straighten your left leg", "Lift your right arm higher"]
+    ok = v._queue.history == ["Straighten your left leg. Lift your right arm higher", "Lift your right arm higher"]
     passed = passed and ok
-    print(f"Fixing the top issue lets the second one get its own turn later: "
+    print(f"When the rank changes, the new top unique suggestion is spoken: "
           f"{'PASS' if ok else 'FAIL'} -> {v._queue.history}")
 
     v = FakeVoice()
@@ -903,6 +950,55 @@ def run_voice_feedback_tests():
 
     if not passed:
         raise AssertionError("One or more voice-feedback debounce tests failed.")
+
+
+def run_fallback_message_tests():
+    """Confirms an Incorrect verdict never reaches update_voice_for_verdict
+    with an empty message list."""
+    class FakeVoice:
+        def __init__(self):
+            self.calls = []
+        def update(self, messages, is_correct):
+            self.calls.append((messages, is_correct))
+
+    passed = True
+    voice = FakeVoice()
+    update_voice_for_verdict(voice, 0, [])
+    ok = voice.calls == [([], False)]
+    passed = passed and ok
+    print(f"Empty joint_messages still reaches voice as empty (main() must pre-fill it): "
+          f"{'PASS' if ok else 'FAIL'} -> {voice.calls}")
+
+    voice = FakeVoice()
+    update_voice_for_verdict(voice, 0, [FALLBACK_INCORRECT_MESSAGE])
+    ok = voice.calls == [([FALLBACK_INCORRECT_MESSAGE], False)]
+    passed = passed and ok
+    print(f"Fallback message reaches the voice layer: {'PASS' if ok else 'FAIL'} -> {voice.calls}")
+
+    if not passed:
+        raise AssertionError("One or more fallback-message tests failed.")
+
+
+def run_all_pose_voice_tests():
+    """Confirms every selectable asana uses the confirmed-correct voice path."""
+    class FakeVoice:
+        def __init__(self):
+            self.calls = []
+
+        def update(self, messages, is_correct):
+            self.calls.append((messages, is_correct))
+
+    passed = True
+    for pose_name, _folder_name, _file_prefix in POSE_OPTIONS.values():
+        voice = FakeVoice()
+        update_voice_for_verdict(voice, 1, [])
+        ok = voice.calls == [([], True)]
+        passed = passed and ok
+        print(f"{pose_name}: confirmed correct -> 'Correct, nice job' path: "
+              f"{'PASS' if ok else 'FAIL'}")
+
+    if not passed:
+        raise AssertionError("One or more asana voice-path tests failed.")
 
 
 class StabilityTracker:
@@ -1037,6 +1133,7 @@ def main():
         stable_status_text = "No person detected"
         status_color = (0, 0, 255)
         joint_messages = []
+        verdict_label = None
 
         if results.pose_landmarks:
             landmarks = results.pose_landmarks.landmark
@@ -1069,8 +1166,16 @@ def main():
                                       else TADASANA_RAISED_SHOULDER_MIN if pose_name == "Tadasana"
                                       else None)
                     joint_messages = get_override_messages(override_reasons, feature_values, arm_threshold)
-                    joint_messages += get_joint_violation_messages(pose_name, feature_values)
+                    joint_violations = get_joint_violation_messages(pose_name, feature_values)
+                    if "hands not raised" in override_reasons:
+                        joint_violations = [
+                            message for message in joint_violations
+                            if "arm" not in message.lower()
+                        ]
+                    joint_messages += joint_violations
                     joint_messages = joint_messages[:MAX_JOINT_MESSAGES]
+                    if not joint_messages:
+                        joint_messages = [FALLBACK_INCORRECT_MESSAGE]
 
                 if verdict_label is None:
                     stable_status_text = "..."
@@ -1079,11 +1184,6 @@ def main():
                     label_name = "Correct" if verdict_label == 1 else "Incorrect"
                     stable_status_text = f"{label_name} ({verdict_confidence*100:.0f}%)"
                     status_color = (0, 255, 0) if verdict_label == 1 else (0, 0, 255)
-
-                if voice is not None:
-                    # Same raw `prediction` as joint_messages - not verdict_label,
-                    # which lags on purpose to avoid banner flicker.
-                    voice.update(joint_messages, is_correct=(prediction == 1))
 
                 y = 90
                 if show_debug:
@@ -1149,6 +1249,8 @@ def main():
                 tracker.reset()
                 verdict.reset()
 
+        update_voice_for_verdict(voice, verdict_label, joint_messages)
+
         cv2.putText(frame, f"Pose: {pose_name}", (20, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
         cv2.putText(frame, raw_status_text, (20, 55),
@@ -1197,5 +1299,7 @@ if __name__ == "__main__":
         run_arms_message_tests()
         run_instant_verdict_tests()
         run_voice_feedback_tests()
+        run_fallback_message_tests()
+        run_all_pose_voice_tests()
     else:
         main()

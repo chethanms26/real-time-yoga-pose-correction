@@ -29,6 +29,8 @@ v7 adds:
 """
 
 import os
+from pathlib import Path
+
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 
@@ -57,7 +59,7 @@ if not TEST_MODE:
 # ---------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------
-BASE_PATH = r"C:\Users\Chethan MS\Documents\Capstone 7"
+BASE_PATH = str(Path(__file__).resolve().parent)
 
 POSE_OPTIONS = {
     "1": ("Ardha Chandrasana", "ARDHA CHANDRASANA", "ardha_chandrasana_rf"),
